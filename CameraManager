@@ -1,0 +1,488 @@
+// CameraManager.swift
+import SwiftUI
+import AVFoundation
+import Photos
+import Combine
+import UIKit
+
+// Playgrounds: enable Camera and Photo Library (Add Only) under App Settings → Capabilities.
+
+enum CameraPermission: Equatable {
+    case notDetermined, authorized, denied, restricted, unavailable
+}
+
+enum ExportStatus: Equatable {
+    case idle, exporting, saved, error(String)
+}
+
+private enum TimelapseError: LocalizedError {
+    case setup
+    var errorDescription: String? { "Could not start the video writer" }
+}
+
+// MARK: - Writer wrapper (touched only on videoQueue)
+private final class TimelapseWriter {
+    let writer: AVAssetWriter
+    let input: AVAssetWriterInput
+    let adaptor: AVAssetWriterInputPixelBufferAdaptor
+    let url: URL
+    let width: Int
+    let height: Int
+    var frameCount = 0
+    
+    init(width: Int, height: Int, fps: Int32) throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("timelapse-\(UUID().uuidString).mp4")
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        
+        let settings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: width * height * 4,
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                AVVideoExpectedSourceFrameRateKey: Int(fps),
+                AVVideoMaxKeyFrameIntervalKey: Int(fps)
+            ] as [String: Any]
+        ]
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        input.expectsMediaDataInRealTime = true
+        
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height
+            ]
+        )
+        
+        guard writer.canAdd(input) else { throw TimelapseError.setup }
+        writer.add(input)
+        guard writer.startWriting() else { throw writer.error ?? TimelapseError.setup }
+        writer.startSession(atSourceTime: .zero)
+        
+        self.url = url
+        self.writer = writer
+        self.input = input
+        self.adaptor = adaptor
+        self.width = width
+        self.height = height
+    }
+}
+
+final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    // MARK: - Published state (mutated on main only)
+    @Published private(set) var permission: CameraPermission = .notDetermined
+    @Published private(set) var isRunning = false
+    @Published private(set) var isInterrupted = false
+    @Published private(set) var isRecordingTimelapse = false
+    @Published private(set) var exportStatus: ExportStatus = .idle
+    
+    // MARK: - Timelapse constants
+    private static let captureInterval: TimeInterval = 5   // real seconds between frames
+    private static let playbackFPS: Int32 = 30             // 5s × 30 = 150s → 1s of video
+    
+    // MARK: - Capture
+    let session = AVCaptureSession()
+    private let sessionQueue = DispatchQueue(label: "latent.camera.session") // serial
+    private let videoQueue = DispatchQueue(label: "latent.camera.video")     // serial: frames + writer
+    private var isConfigured = false                                         // sessionQueue only
+    private var videoOutput: AVCaptureVideoDataOutput?                       // sessionQueue only
+    
+    // MARK: - Timelapse state (videoQueue only)
+    private var timelapse: TimelapseWriter?
+    private var capturing = false
+    private var lastCaptureTime: CMTime?
+    
+    // MARK: - Rotation (main only)
+    private var captureDevice: AVCaptureDevice?
+    private weak var previewLayer: AVCaptureVideoPreviewLayer?
+    private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
+    private var previewObservation: NSKeyValueObservation?
+    private var captureObservation: NSKeyValueObservation?
+    private var cancellables = Set<AnyCancellable>()
+    
+    override init() {
+        super.init()
+        permission = Self.map(AVCaptureDevice.authorizationStatus(for: .video))
+        
+        // Split View / multitasking can interrupt camera access
+        let nc = NotificationCenter.default
+        nc.publisher(for: AVCaptureSession.wasInterruptedNotification, object: session)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.isInterrupted = true }
+            .store(in: &cancellables)
+        nc.publisher(for: AVCaptureSession.interruptionEndedNotification, object: session)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.isInterrupted = false }
+            .store(in: &cancellables)
+    }
+    
+    deinit {
+        let s = session
+        sessionQueue.async { if s.isRunning { s.stopRunning() } }
+        let tl = timelapse
+        videoQueue.async {
+            tl?.writer.cancelWriting()
+            if let url = tl?.url { try? FileManager.default.removeItem(at: url) }
+        }
+    }
+    
+    // MARK: - Session API (call from main)
+    func startSession() {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            if permission != .unavailable { permission = .authorized }
+            configureAndRun()
+        case .notDetermined:
+            permission = .notDetermined
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.permission = granted ? .authorized : .denied
+                    if granted { self.configureAndRun() }
+                }
+            }
+        case .denied:
+            permission = .denied
+        case .restricted:
+            permission = .restricted
+        @unknown default:
+            permission = .denied
+        }
+    }
+    
+    func stopSession() {
+        sessionQueue.async { [weak self] in
+            guard let self, self.session.isRunning else { return }
+            self.session.stopRunning()
+            DispatchQueue.main.async { self.isRunning = false }
+        }
+    }
+    
+    /// Called by CameraPreviewView once its layer exists.
+    func attach(previewLayer layer: AVCaptureVideoPreviewLayer) {
+        previewLayer = layer
+        refreshRotationCoordinator()
+    }
+    
+    // MARK: - Timelapse API (call from main)
+    /// Begin or resume capturing (writer is created lazily on the first frame).
+    func startTimelapse() {
+        isRecordingTimelapse = true
+        videoQueue.async { [weak self] in
+            self?.lastCaptureTime = nil   // grab a frame immediately on resume
+            self?.capturing = true
+        }
+    }
+    
+    /// Stop grabbing frames but keep the partially written video open.
+    func pauseTimelapse() {
+        isRecordingTimelapse = false
+        videoQueue.async { [weak self] in self?.capturing = false }
+    }
+    
+    /// Finalize the .mp4 and save it to the Photos library.
+    func finishTimelapse() {
+        isRecordingTimelapse = false
+        videoQueue.async { [weak self] in
+            guard let self else { return }
+            self.capturing = false
+            guard let tl = self.timelapse else { return } // nothing recorded
+            self.timelapse = nil
+            
+            guard tl.frameCount > 0 else {
+                tl.writer.cancelWriting()
+                try? FileManager.default.removeItem(at: tl.url)
+                return
+            }
+            
+            DispatchQueue.main.async { self.exportStatus = .exporting }
+            
+            tl.input.markAsFinished()
+            // Give the last frame a 1/30s duration
+            tl.writer.endSession(atSourceTime: CMTime(value: CMTimeValue(tl.frameCount),
+                                                      timescale: Self.playbackFPS))
+            tl.writer.finishWriting { [weak self] in
+                guard let self else { return }
+                if tl.writer.status == .completed {
+                    self.saveToPhotos(tl.url)
+                } else {
+                    try? FileManager.default.removeItem(at: tl.url)
+                    self.publish(.error(tl.writer.error?.localizedDescription ?? "Export failed"))
+                }
+            }
+        }
+    }
+    
+    // MARK: - Photos export
+    private func saveToPhotos(_ url: URL) {
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
+            guard status == .authorized || status == .limited else {
+                try? FileManager.default.removeItem(at: url)
+                self?.publish(.error("Photos access denied"))
+                return
+            }
+            PHPhotoLibrary.shared().performChanges({
+                _ = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+            }) { success, error in
+                try? FileManager.default.removeItem(at: url) // clean temp file either way
+                self?.publish(success ? .saved : .error(error?.localizedDescription ?? "Save failed"))
+            }
+        }
+    }
+    
+    /// Sets status on main and auto-clears terminal states.
+    private func publish(_ status: ExportStatus) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.exportStatus = status
+            guard status != .idle, status != .exporting else { return }
+            let delay: TimeInterval = (status == .saved) ? 3 : 6
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                if self?.exportStatus == status { self?.exportStatus = .idle }
+            }
+        }
+    }
+    
+    // MARK: - Frame delegate (videoQueue)
+    func captureOutput(_ output: AVCaptureOutput,
+                       didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        guard capturing, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        
+        // Throttle to one frame per captureInterval
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        if let last = lastCaptureTime,
+           CMTimeGetSeconds(CMTimeSubtract(pts, last)) < Self.captureInterval { return }
+        
+        // Lazily create the writer using the real buffer size
+        if timelapse == nil {
+            do {
+                timelapse = try TimelapseWriter(width: CVPixelBufferGetWidth(pixelBuffer),
+                                                height: CVPixelBufferGetHeight(pixelBuffer),
+                                                fps: Self.playbackFPS)
+            } catch {
+                capturing = false
+                DispatchQueue.main.async { self.isRecordingTimelapse = false }
+                publish(.error(error.localizedDescription))
+                return
+            }
+        }
+        guard let tl = timelapse else { return }
+        
+        // Skip frames whose size changed (e.g. orientation flip) — writer size is fixed
+        guard CVPixelBufferGetWidth(pixelBuffer) == tl.width,
+              CVPixelBufferGetHeight(pixelBuffer) == tl.height,
+              tl.input.isReadyForMoreMediaData else { return }
+        
+        // Synthetic timeline: frame N → N/30 s, giving 150 real seconds per 1s of video
+        let outTime = CMTime(value: CMTimeValue(tl.frameCount), timescale: Self.playbackFPS)
+        if tl.adaptor.append(pixelBuffer, withPresentationTime: outTime) {
+            tl.frameCount += 1
+            lastCaptureTime = pts
+        } else {
+            // Writer failed: tear down and report
+            let message = tl.writer.error?.localizedDescription ?? "Encoding failed"
+            tl.writer.cancelWriting()
+            try? FileManager.default.removeItem(at: tl.url)
+            timelapse = nil
+            capturing = false
+            DispatchQueue.main.async { self.isRecordingTimelapse = false }
+            publish(.error(message))
+        }
+    }
+    
+    // MARK: - Session setup
+    private func configureAndRun() {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            var device: AVCaptureDevice?
+            if !self.isConfigured { device = self.configureSession() }
+            guard self.isConfigured else { return }
+            if !self.session.isRunning { self.session.startRunning() }
+            let running = self.session.isRunning
+            DispatchQueue.main.async {
+                if let device { self.captureDevice = device }
+                self.isRunning = running
+                self.refreshRotationCoordinator()
+            }
+        }
+    }
+    
+    /// Runs on sessionQueue. Returns the device on success.
+    private func configureSession() -> AVCaptureDevice? {
+        session.beginConfiguration()
+        defer { session.commitConfiguration() }
+        session.sessionPreset = .high
+        
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front),
+              let input = try? AVCaptureDeviceInput(device: device),
+              session.canAddInput(input) else {
+            DispatchQueue.main.async { self.permission = .unavailable }
+            return nil
+        }
+        session.addInput(input)
+        
+        // Frame output for timelapse (preview still works if this fails)
+        let output = AVCaptureVideoDataOutput()
+        output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)]
+        output.alwaysDiscardsLateVideoFrames = true
+        output.setSampleBufferDelegate(self, queue: videoQueue)
+        if session.canAddOutput(output) {
+            session.addOutput(output)
+            videoOutput = output
+        }
+        
+        isConfigured = true
+        return device
+    }
+    
+    // MARK: - Rotation handling (iPadOS 17+)
+    private func refreshRotationCoordinator() {
+        guard let device = captureDevice, let layer = previewLayer else { return }
+        let coordinator = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: layer)
+        rotationCoordinator = coordinator
+        // Re-apply whenever horizon-level angles change (device/interface rotation)
+        previewObservation = coordinator.observe(
+            \.videoRotationAngleForHorizonLevelPreview,
+             options: [.initial, .new]
+        ) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.applyRotation() }
+        }
+        captureObservation = coordinator.observe(
+            \.videoRotationAngleForHorizonLevelCapture,
+             options: [.new]
+        ) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.applyRotation() }
+        }
+    }
+    
+    private func applyRotation() {
+        guard let coordinator = rotationCoordinator else { return }
+        
+        // Preview layer
+        let previewAngle = coordinator.videoRotationAngleForHorizonLevelPreview
+        if let connection = previewLayer?.connection,
+           connection.isVideoRotationAngleSupported(previewAngle) {
+            connection.videoRotationAngle = previewAngle
+        }
+        
+        // Video data output (so timelapse frames are upright too)
+        let captureAngle = coordinator.videoRotationAngleForHorizonLevelCapture
+        sessionQueue.async { [weak self] in
+            guard let conn = self?.videoOutput?.connection(with: .video),
+                  conn.isVideoRotationAngleSupported(captureAngle) else { return }
+            conn.videoRotationAngle = captureAngle
+        }
+    }
+    
+    private static func map(_ status: AVAuthorizationStatus) -> CameraPermission {
+        switch status {
+        case .authorized: return .authorized
+        case .notDetermined: return .notDetermined
+        case .restricted: return .restricted
+        case .denied: return .denied
+        @unknown default: return .denied
+        }
+    }
+}
+
+// MARK: - Preview view
+final class PreviewUIView: UIView {
+    override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
+    var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
+}
+
+struct CameraPreviewView: UIViewRepresentable {
+    let manager: CameraManager
+    
+    func makeUIView(context: Context) -> PreviewUIView {
+        let view = PreviewUIView()
+        view.backgroundColor = .black
+        view.previewLayer.videoGravity = .resizeAspectFill
+        view.previewLayer.session = manager.session
+        manager.attach(previewLayer: view.previewLayer) // rotation coordinator hooks in here
+        return view
+    }
+    
+    func updateUIView(_ uiView: PreviewUIView, context: Context) {}
+}
+
+// MARK: - Permission / interruption fallback UI
+struct CameraStatusOverlay: View {
+    @ObservedObject var manager: CameraManager
+    
+    private var status: (icon: String, text: String)? {
+        switch manager.permission {
+        case .authorized:
+            return manager.isInterrupted ? ("pause.circle", "Camera paused while multitasking") : nil
+        case .notDetermined: return ("camera.fill", "Requesting camera access…")
+        case .denied:        return ("video.slash", "Camera access is turned off")
+        case .restricted:    return ("lock.fill", "Camera access is restricted on this device")
+        case .unavailable:   return ("video.slash", "Front camera unavailable")
+        }
+    }
+    
+    var body: some View {
+        if let status = status {
+            VStack(spacing: 12) {
+                Image(systemName: status.icon).font(.system(size: 48))
+                Text(status.text).font(.headline).multilineTextAlignment(.center)
+                if manager.permission == .denied {
+                    Button("Open Settings") {
+                        if let url = URL(string: UIApplication.openSettingsURLString) {
+                            UIApplication.shared.open(url)
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+            .foregroundStyle(.white)
+            .padding()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.black.opacity(0.85))
+        }
+    }
+}
+
+// MARK: - Timelapse / export status badge
+struct ExportStatusBadge: View {
+    @ObservedObject var manager: CameraManager
+    
+    var body: some View {
+        Group {
+            switch manager.exportStatus {
+            case .idle:
+                if manager.isRecordingTimelapse && manager.isRunning {
+                    pill { Label("Timelapse REC", systemImage: "record.circle").foregroundStyle(.red) }
+                }
+            case .exporting:
+                pill {
+                    HStack(spacing: 8) {
+                        ProgressView().tint(.white)
+                        Text("Saving timelapse…")
+                    }
+                }
+            case .saved:
+                pill { Label("Saved to Photos", systemImage: "checkmark.circle.fill").foregroundStyle(.green) }
+            case .error(let message):
+                pill { Label(message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: manager.exportStatus)
+    }
+    
+    private func pill<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        content()
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color.black.opacity(0.6), in: Capsule())
+            .padding(12)
+    }
+}
+    
