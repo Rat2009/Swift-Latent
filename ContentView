@@ -1,59 +1,66 @@
+// ============================================================
+// FILE 5/5: ContentView.swift
+// ============================================================
 import SwiftUI
 import UIKit
+import AudioToolbox
+import AVKit
+import Photos
 
 struct ContentView: View {
     // MARK: - Environment
     @Environment(\.scenePhase) private var scenePhase
-    
-    // MARK: - Persistence
-    @AppStorage("todayMinutes") private var todayMinutes: Double = 0
-    @AppStorage("todayDayKey") private var todayDayKey: String = ""
-    @AppStorage("lastStudyDayKey") private var lastStudyDayKey: String = ""
-    @AppStorage("dailyStreak") private var dailyStreak: Int = 0
-    
+
+    // MARK: - Services
+    @StateObject private var camera = CameraManager()
+    @StateObject private var store = SessionStore()
+
+    // MARK: - Sheets
+    @State private var showHistory = false
+    @State private var showStats = false
+    @State private var shareSession: StudySession?
+
     // MARK: - Tags
     @State private var tags: [String] = ["Math", "CS", "Physics", "English"]
     @State private var selectedTag: String = "Math"
     @State private var customTag: String = ""
-    
+
     // MARK: - Timer state
     @State private var isRunning = false
     @State private var startDate: Date? = nil
     @State private var accumulated: TimeInterval = 0
     @State private var elapsed: TimeInterval = 0
     private let ticker = Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()
-    
+
     // MARK: - Screen options
     @State private var keepAwake = false
     @State private var isDimmed = false
-    
+
+    // MARK: - Window width guard
+    @State private var isNarrow = false
+    @State private var pausedForWidth = false
+
     var body: some View {
         ZStack {
             HStack(spacing: 24) {
                 controlPanel
                     .frame(maxWidth: .infinity)
-                
-                // Placeholder for future live camera preview
+
+                // Live front-camera preview
                 ZStack {
-                    RoundedRectangle(cornerRadius: 28, style: .continuous)
-                        .fill(Color.secondary.opacity(0.12))
-                    RoundedRectangle(cornerRadius: 28, style: .continuous)
-                        .strokeBorder(style: StrokeStyle(lineWidth: 2, dash: [10, 8]))
-                        .foregroundStyle(.secondary.opacity(0.5))
-                    VStack(spacing: 12) {
-                        Image(systemName: "camera.viewfinder")
-                            .font(.system(size: 56))
-                        Text("Camera Preview")
-                            .font(.title3.weight(.semibold))
-                        Text("Reserved for future use")
-                            .font(.footnote)
-                    }
-                    .foregroundStyle(.secondary)
+                    Color.black
+                    CameraPreviewView(manager: camera)
+                    CameraStatusOverlay(manager: camera)
                 }
+                .overlay(alignment: .topLeading) { ExportStatusBadge(manager: camera) }
+                .overlay(alignment: .topTrailing) {
+                    if camera.isRecordingTimelapse { RecPill() }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .padding(28)
-            
+
             // Dim overlay with tap-to-wake
             if isDimmed {
                 Color.black.opacity(0.85)
@@ -75,34 +82,70 @@ struct ContentView: View {
                     .zIndex(10)
             }
         }
-        .onAppear { rolloverIfNeeded() }
+        .onAppear { camera.startSession() }
         .onReceive(ticker) { _ in
             // Recompute from wall clock for drift-free timing
             if isRunning, let start = startDate {
                 elapsed = accumulated + Date().timeIntervalSince(start)
             }
         }
-        .onChange(of: scenePhase) { newPhase in
+        // iOS 17 two-parameter onChange
+        .onChange(of: scenePhase) { _, newPhase in
             if newPhase != .active {
-                pauseTimer()            // auto-pause when leaving app / Split View
+                pauseTimer()             // auto-pause when leaving app / Split View
+                camera.stopSession()
             } else {
-                rolloverIfNeeded()
+                camera.startSession()
             }
         }
-        .onChange(of: keepAwake) { newValue in
+        .onChange(of: keepAwake) { _, newValue in
             UIApplication.shared.isIdleTimerDisabled = newValue
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
+            camera.stopSession()
         }
+        // Window width detection (Split View / Slide Over)
+        .background(
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear { updateWidth(geo.size.width) }
+                    .onChange(of: geo.size.width) { _, newWidth in updateWidth(newWidth) }
+            }
+        )
+        .overlay(alignment: .top) {
+            if isNarrow {
+                Label("Window too narrow — timer paused. Expand to resume.",
+                      systemImage: "arrow.left.and.right.square")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.black)
+                    .frame(maxWidth: .infinity)
+                    .padding(12)
+                    .background(Color.orange)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .sheet(isPresented: $showHistory) { HistoryView(store: store) }
+        .sheet(isPresented: $showStats) { StatsView(store: store) }
+        .sheet(item: $shareSession) { ShareSummarySheet(session: $0, streak: store.currentStreakDays) }
     }
-    
+
     // MARK: - Left control panel
     private var controlPanel: some View {
         VStack(alignment: .leading, spacing: 22) {
-            Text("Latent iPad")
-                .font(.largeTitle.bold())
-            
+            HStack(spacing: 10) {
+                Text("Latent iPad").font(.largeTitle.bold())
+                Spacer()
+                Button { showStats = true } label: {
+                    Label("Stats", systemImage: "chart.bar.xaxis")
+                }
+                .buttonStyle(.bordered)
+                Button { showHistory = true } label: {
+                    Label("History", systemImage: "clock.arrow.circlepath")
+                }
+                .buttonStyle(.bordered)
+            }
+
             // Subject tags
             VStack(alignment: .leading, spacing: 10) {
                 Text("Subject").font(.headline)
@@ -136,7 +179,7 @@ struct ContentView: View {
                         .disabled(customTag.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
-            
+
             // Stopwatch
             VStack(alignment: .leading, spacing: 4) {
                 Text(selectedTag.uppercased())
@@ -148,23 +191,23 @@ struct ContentView: View {
                     .minimumScaleFactor(0.5)
                     .lineLimit(1)
             }
-            
+
             // Controls
             HStack(spacing: 14) {
-                Button(action: startTimer) {
+                Button { startTimer() } label: {
                     Label("Start", systemImage: "play.fill").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.green)
-                .disabled(isRunning)
-                
-                Button(action: pauseTimer) {
+                .disabled(isRunning || isNarrow)
+
+                Button { pauseTimer(haptic: true) } label: {
                     Label("Pause", systemImage: "pause.fill").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.orange)
                 .disabled(!isRunning)
-                
+
                 Button(role: .destructive, action: endSession) {
                     Label("End Session", systemImage: "stop.fill").frame(maxWidth: .infinity)
                 }
@@ -173,7 +216,7 @@ struct ContentView: View {
                 .disabled(elapsed < 1)
             }
             .controlSize(.large)
-            
+
             // Screen options
             VStack(alignment: .leading, spacing: 8) {
                 Toggle("Keep Screen Awake", isOn: $keepAwake)
@@ -182,17 +225,20 @@ struct ContentView: View {
                     set: { newValue in withAnimation(.easeInOut(duration: 0.25)) { isDimmed = newValue } }
                 ))
             }
-            
+
             Spacer(minLength: 0)
-            
-            // Stats
+
+            // Stats (from SessionStore)
             HStack(spacing: 14) {
-                statCard(title: "Today", value: "\(Int(todayMinutes.rounded())) min", icon: "clock.fill")
-                statCard(title: "Streak", value: "\(dailyStreak) day\(dailyStreak == 1 ? "" : "s")", icon: "flame.fill")
+                statCard(title: "Today", value: "\(Int(store.todayMinutes.rounded())) min", icon: "clock.fill")
+                statCard(title: "Week", value: "\(Int(store.weeklyMinutes.rounded())) min", icon: "calendar")
+                statCard(title: "Streak",
+                         value: "\(store.currentStreakDays) day\(store.currentStreakDays == 1 ? "" : "s")",
+                         icon: "flame.fill")
             }
         }
     }
-    
+
     private func statCard(title: String, value: String, icon: String) -> some View {
         HStack(spacing: 12) {
             Image(systemName: icon).font(.title2).foregroundStyle(.tint)
@@ -205,39 +251,64 @@ struct ContentView: View {
         .padding(14)
         .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.secondary.opacity(0.12)))
     }
-    
+
+    // MARK: - Feedback
+    private func feedback(_ style: UIImpactFeedbackGenerator.FeedbackStyle) {
+        UIImpactFeedbackGenerator(style: style).impactOccurred()
+        AudioServicesPlaySystemSound(1104)
+    }
+
+    // MARK: - Width guard
+    private func updateWidth(_ width: CGFloat) {
+        let narrow = width < 600
+        guard narrow != isNarrow else { return }
+        withAnimation(.easeInOut(duration: 0.25)) { isNarrow = narrow }
+        if narrow {
+            if isRunning { pausedForWidth = true; pauseTimer() }
+        } else if pausedForWidth {
+            pausedForWidth = false
+            startTimer(haptic: false) // resume once expanded
+        }
+    }
+
     // MARK: - Timer actions
-    private func startTimer() {
+    private func startTimer(haptic: Bool = true) {
         guard !isRunning else { return }
+        if haptic { feedback(.light) }
         startDate = Date()
         isRunning = true
+        camera.startTimelapse()
     }
-    
-    private func pauseTimer() {
+
+    private func pauseTimer(haptic: Bool = false) {
         guard isRunning, let start = startDate else { return }
+        if haptic { feedback(.soft) }
         accumulated += Date().timeIntervalSince(start)
         elapsed = accumulated
         startDate = nil
         isRunning = false
+        camera.pauseTimelapse() // also fires on scenePhase auto-pause
     }
-    
+
     private func endSession() {
         pauseTimer()
-        rolloverIfNeeded()
-        let minutes = elapsed / 60
-        if minutes > 0 {
-            todayMinutes += minutes
-            let today = Self.dayKey(Date())
-            if lastStudyDayKey != today {
-                // Continue streak only if last study day was yesterday
-                dailyStreak = (lastStudyDayKey == Self.yesterdayKey()) ? dailyStreak + 1 : 1
-                lastStudyDayKey = today
-            }
-        }
+        pausedForWidth = false
+        let seconds = Int(elapsed)
+        let subject = selectedTag
+        let date = Date()
+        if seconds >= 1 { feedback(.heavy) } // session complete
         accumulated = 0
         elapsed = 0
+        // Session saved once the Photos asset ID is known (nil if no video)
+        camera.finishTimelapse { assetID in
+            guard seconds >= 1 else { return }
+            shareSession = store.addSession(subject: subject,
+                                            durationSeconds: seconds,
+                                            date: date,
+                                            timelapseAssetID: assetID)
+        }
     }
-    
+
     // MARK: - Tags
     private func addCustomTag() {
         let trimmed = customTag.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -250,34 +321,156 @@ struct ContentView: View {
         }
         customTag = ""
     }
-    
-    // MARK: - Daily rollover / streak upkeep
-    private func rolloverIfNeeded() {
-        let today = Self.dayKey(Date())
-        guard todayDayKey != today else { return }
-        todayDayKey = today
-        todayMinutes = 0
-        // Break streak if the last study day wasn't today or yesterday
-        if lastStudyDayKey != today && lastStudyDayKey != Self.yesterdayKey() {
-            dailyStreak = 0
-        }
-    }
-    
+
     // MARK: - Helpers
     private func formatted(_ interval: TimeInterval) -> String {
         let total = max(0, Int(interval))
         return String(format: "%02d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
     }
-    
-    private static func dayKey(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "yyyy-MM-dd"
-        return f.string(from: date)
+}
+
+// MARK: - REC pill
+struct RecPill: View {
+    @State private var pulse = false
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(.red)
+                .frame(width: 10, height: 10)
+                .opacity(pulse ? 0.25 : 1)
+            Text("REC • TIMELAPSE")
+                .font(.footnote.weight(.bold))
+                .tracking(1)
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.red.opacity(0.85), in: Capsule())
+        .padding(12)
+        .onAppear {
+            withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) { pulse = true }
+        }
     }
-    
-    private static func yesterdayKey() -> String {
-        let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: Date()) ?? Date()
-        return dayKey(yesterday)
+}
+
+// MARK: - History sheet
+struct HistoryView: View {
+    @ObservedObject var store: SessionStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var selected: StudySession?
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    HStack {
+                        summary("Today", "\(Int(store.todayMinutes.rounded())) min")
+                        Divider()
+                        summary("7 Days", "\(Int(store.weeklyMinutes.rounded())) min")
+                        Divider()
+                        summary("Streak", "\(store.currentStreakDays)d")
+                    }
+                }
+                Section("Sessions") {
+                    if store.sessions.isEmpty {
+                        Text("No sessions yet").foregroundStyle(.secondary)
+                    }
+                    ForEach(store.sessions) { s in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(s.subject).font(.headline)
+                                Text(s.date.formatted(date: .abbreviated, time: .shortened))
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if s.timelapseAssetID != nil {
+                                Image(systemName: "film").foregroundStyle(.secondary)
+                            }
+                            Text(duration(s.durationSeconds)).monospacedDigit()
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture { if s.timelapseAssetID != nil { selected = s } }
+                    }
+                    .onDelete(perform: store.deleteSession) // swipe or Edit mode
+                }
+            }
+            .navigationTitle("History")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { EditButton() }
+                ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } }
+            }
+            .sheet(item: $selected) { TimelapsePlayerSheet(assetID: $0.timelapseAssetID ?? "") }
+        }
+    }
+
+    private func summary(_ title: String, _ value: String) -> some View {
+        VStack {
+            Text(value).font(.title3.weight(.semibold))
+            Text(title).font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func duration(_ seconds: Int) -> String {
+        String(format: "%02d:%02d:%02d", seconds / 3600, (seconds % 3600) / 60, seconds % 60)
+    }
+}
+
+// MARK: - Timelapse player (looping)
+struct TimelapsePlayerSheet: View {
+    let assetID: String
+    @Environment(\.dismiss) private var dismiss
+    @State private var player: AVQueuePlayer?
+    @State private var looper: AVPlayerLooper? // must be retained for looping
+    @State private var errorText: String?
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                Color.black.ignoresSafeArea()
+                if let player {
+                    VideoPlayer(player: player)
+                } else if let errorText {
+                    Label(errorText, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.white)
+                } else {
+                    ProgressView().tint(.white)
+                }
+            }
+            .navigationTitle("Timelapse")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } }
+            }
+        }
+        .task { await load() }
+        .onDisappear {
+            player?.pause()
+            player = nil
+            looper = nil
+        }
+    }
+
+    private func load() async {
+        let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+        guard status == .authorized || status == .limited else {
+            errorText = "Photos access denied"
+            return
+        }
+        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [assetID], options: nil).firstObject else {
+            errorText = "Video not found in Photos"
+            return
+        }
+        let options = PHVideoRequestOptions()
+        options.isNetworkAccessAllowed = true // allow iCloud download
+        PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { avAsset, _, _ in
+            Task { @MainActor in
+                guard let avAsset else { errorText = "Could not load video"; return }
+                let queue = AVQueuePlayer()
+                looper = AVPlayerLooper(player: queue, templateItem: AVPlayerItem(asset: avAsset))
+                player = queue
+                queue.play()
+            }
+        }
     }
 }
