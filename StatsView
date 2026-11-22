@@ -1,0 +1,191 @@
+// ============================================================
+// FILE 4/5: StatsView.swift
+// ============================================================
+import SwiftUI
+import Charts
+
+struct StatsView: View {
+    @ObservedObject var store: SessionStore
+    @Environment(\.dismiss) private var dismiss
+    
+    // Daily goal in minutes (30 min – 6 h)
+    @AppStorage("dailyGoalMinutes") private var goalMinutes: Double = 120
+    
+    private let calendar = Calendar.current
+    
+    // MARK: - Chart data
+    private struct DayBar: Identifiable {
+        let id = UUID()
+        let day: Date
+        let subject: String
+        let minutes: Double
+    }
+    
+    /// Past 7 days (including today), one bar segment per subject per day.
+    private var weekBars: [DayBar] {
+        let today = calendar.startOfDay(for: Date())
+        var bars: [DayBar] = []
+        for offset in -6...0 {
+            guard let day = calendar.date(byAdding: .day, value: offset, to: today) else { continue }
+            let daySessions = store.sessions.filter { calendar.startOfDay(for: $0.date) == day }
+            let bySubject = Dictionary(grouping: daySessions, by: \.subject)
+            for (subject, items) in bySubject {
+                let mins = Double(items.reduce(0) { $0 + $1.durationSeconds }) / 60
+                bars.append(DayBar(day: day, subject: subject, minutes: mins))
+            }
+        }
+        return bars
+    }
+    
+    private var weekDomain: ClosedRange<Date> {
+        let today = calendar.startOfDay(for: Date())
+        let start = calendar.date(byAdding: .day, value: -6, to: today) ?? today
+        let end = calendar.date(byAdding: .day, value: 1, to: today) ?? today
+        return start...end
+    }
+    
+    // MARK: - Summary stats
+    private var totalHoursText: String {
+        let secs = store.sessions.reduce(0) { $0 + $1.durationSeconds }
+        return String(format: "%.1f h", Double(secs) / 3600)
+    }
+    
+    /// Longest run of consecutive study days, all-time.
+    private var bestStreak: Int {
+        let days = Set(store.sessions.map { calendar.startOfDay(for: $0.date) }).sorted()
+        var best = 0, run = 0
+        var prev: Date?
+        for d in days {
+            if let p = prev, calendar.date(byAdding: .day, value: 1, to: p) == d { run += 1 } else { run = 1 }
+            best = max(best, run)
+            prev = d
+        }
+        return best
+    }
+    
+    private var topSubject: String {
+        let totals = Dictionary(grouping: store.sessions, by: \.subject)
+            .mapValues { $0.reduce(0) { $0 + $1.durationSeconds } }
+        return totals.max { $0.value < $1.value }?.key ?? "—"
+    }
+    
+    private var progress: Double {
+        min(1, store.todayMinutes / max(goalMinutes, 1))
+    }
+    
+    // MARK: - Body
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 24) {
+                    goalSection
+                    chartSection
+                    summaryCards
+                }
+                .padding(24)
+            }
+            .navigationTitle("Stats")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } }
+            }
+        }
+    }
+    
+    // MARK: - Goal + ring
+    private var goalSection: some View {
+        HStack(spacing: 32) {
+            ZStack {
+                Circle().stroke(Color.secondary.opacity(0.2), lineWidth: 18)
+                Circle()
+                    .trim(from: 0, to: progress)
+                    .stroke(progress >= 1 ? Color.green : Color.accentColor,
+                            style: StrokeStyle(lineWidth: 18, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .animation(.easeOut(duration: 0.5), value: progress)
+                VStack(spacing: 2) {
+                    Text("\(Int((progress * 100).rounded()))%")
+                        .font(.system(size: 36, weight: .bold, design: .rounded))
+                    Text("\(Int(store.todayMinutes.rounded())) / \(Int(goalMinutes)) min")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .frame(width: 180, height: 180)
+            
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Daily Goal").font(.headline)
+                Text(goalLabel(goalMinutes))
+                    .font(.system(size: 34, weight: .bold, design: .rounded))
+                Slider(value: $goalMinutes, in: 30...360, step: 15)
+                HStack {
+                    Text("30 min"); Spacer(); Text("6 h")
+                }
+                .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .padding(20)
+        .background(RoundedRectangle(cornerRadius: 20, style: .continuous).fill(Color.secondary.opacity(0.1)))
+    }
+    
+    private func goalLabel(_ minutes: Double) -> String {
+        let m = Int(minutes)
+        return m % 60 == 0 ? "\(m / 60)h" : (m >= 60 ? "\(m / 60)h \(m % 60)m" : "\(m)m")
+    }
+    
+    // MARK: - 7-day chart
+    private var chartSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Last 7 Days").font(.headline)
+            Chart {
+                ForEach(weekBars) { bar in
+                    BarMark(
+                        x: .value("Day", bar.day, unit: .day),
+                        y: .value("Minutes", bar.minutes)
+                    )
+                    .foregroundStyle(by: .value("Subject", bar.subject)) // color-coded by tag
+                }
+                // Goal reference line
+                RuleMark(y: .value("Goal", goalMinutes))
+                    .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
+                    .foregroundStyle(.secondary)
+            }
+            .chartXScale(domain: weekDomain)
+            .chartXAxis {
+                AxisMarks(values: .stride(by: .day)) { _ in
+                    AxisGridLine()
+                    AxisValueLabel(format: .dateTime.weekday(.abbreviated), centered: true)
+                }
+            }
+            .chartYAxisLabel("min")
+            .frame(height: 280)
+            
+            if weekBars.isEmpty {
+                Text("No sessions this week").font(.footnote).foregroundStyle(.secondary)
+            }
+        }
+        .padding(20)
+        .background(RoundedRectangle(cornerRadius: 20, style: .continuous).fill(Color.secondary.opacity(0.1)))
+    }
+    
+    // MARK: - Summary cards
+    private var summaryCards: some View {
+        HStack(spacing: 16) {
+            card("Total Time", totalHoursText, "hourglass", .blue)
+            card("Best Streak", "\(bestStreak) day\(bestStreak == 1 ? "" : "s")", "flame.fill", .orange)
+            card("Top Subject", topSubject, "star.fill", .purple)
+        }
+    }
+    
+    private func card(_ title: String, _ value: String, _ icon: String, _ tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Image(systemName: icon).font(.title2).foregroundStyle(tint)
+            Text(value)
+                .font(.system(size: 28, weight: .bold, design: .rounded))
+                .minimumScaleFactor(0.5).lineLimit(1)
+            Text(title).font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(18)
+        .background(RoundedRectangle(cornerRadius: 20, style: .continuous).fill(Color.secondary.opacity(0.1)))
+    }
+}
