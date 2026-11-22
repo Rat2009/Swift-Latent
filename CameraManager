@@ -183,57 +183,61 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
         isRecordingTimelapse = false
         videoQueue.async { [weak self] in self?.capturing = false }
     }
-    
-    /// Finalize the .mp4 and save it to the Photos library.
-    func finishTimelapse() {
-        isRecordingTimelapse = false
-        videoQueue.async { [weak self] in
+    /// Finalize the .mp4, save to Photos, and report the created asset's localIdentifier (nil on any failure).
+func finishTimelapse(completion: @escaping @MainActor (String?) -> Void) {
+    isRecordingTimelapse = false
+    videoQueue.async { [weak self] in
+        guard let self else { return }
+        let done: (String?) -> Void = { id in Task { @MainActor in completion(id) } }
+
+        self.capturing = false
+        guard let tl = self.timelapse else { done(nil); return } // nothing recorded
+        self.timelapse = nil
+
+        guard tl.frameCount > 0 else {
+            tl.writer.cancelWriting()
+            try? FileManager.default.removeItem(at: tl.url)
+            done(nil)
+            return
+        }
+
+        DispatchQueue.main.async { self.exportStatus = .exporting }
+
+        tl.input.markAsFinished()
+        tl.writer.endSession(atSourceTime: CMTime(value: CMTimeValue(tl.frameCount),
+                                                  timescale: Self.playbackFPS))
+        tl.writer.finishWriting { [weak self] in
             guard let self else { return }
-            self.capturing = false
-            guard let tl = self.timelapse else { return } // nothing recorded
-            self.timelapse = nil
-            
-            guard tl.frameCount > 0 else {
-                tl.writer.cancelWriting()
+            if tl.writer.status == .completed {
+                self.saveToPhotos(tl.url, completion: done)
+            } else {
                 try? FileManager.default.removeItem(at: tl.url)
-                return
-            }
-            
-            DispatchQueue.main.async { self.exportStatus = .exporting }
-            
-            tl.input.markAsFinished()
-            // Give the last frame a 1/30s duration
-            tl.writer.endSession(atSourceTime: CMTime(value: CMTimeValue(tl.frameCount),
-                                                      timescale: Self.playbackFPS))
-            tl.writer.finishWriting { [weak self] in
-                guard let self else { return }
-                if tl.writer.status == .completed {
-                    self.saveToPhotos(tl.url)
-                } else {
-                    try? FileManager.default.removeItem(at: tl.url)
-                    self.publish(.error(tl.writer.error?.localizedDescription ?? "Export failed"))
-                }
+                self.publish(.error(tl.writer.error?.localizedDescription ?? "Export failed"))
+                done(nil)
             }
         }
     }
-    
-    // MARK: - Photos export
-    private func saveToPhotos(_ url: URL) {
-        PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
-            guard status == .authorized || status == .limited else {
-                try? FileManager.default.removeItem(at: url)
-                self?.publish(.error("Photos access denied"))
-                return
-            }
-            PHPhotoLibrary.shared().performChanges({
-                _ = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
-            }) { success, error in
-                try? FileManager.default.removeItem(at: url) // clean temp file either way
-                self?.publish(success ? .saved : .error(error?.localizedDescription ?? "Save failed"))
-            }
+}
+
+private func saveToPhotos(_ url: URL, completion: @escaping (String?) -> Void) {
+    PHPhotoLibrary.requestAuthorization(for: .readWrite) { [weak self] status in
+        guard status == .authorized || status == .limited else {
+            try? FileManager.default.removeItem(at: url)
+            self?.publish(.error("Photos access denied"))
+            completion(nil)
+            return
+        }
+        var assetID: String?
+        PHPhotoLibrary.shared().performChanges({
+            let req = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+            assetID = req?.placeholderForCreatedAsset?.localIdentifier
+        }) { success, error in
+            try? FileManager.default.removeItem(at: url)
+            self?.publish(success ? .saved : .error(error?.localizedDescription ?? "Save failed"))
+            completion(success ? assetID : nil)
         }
     }
-    
+}
     /// Sets status on main and auto-clears terminal states.
     private func publish(_ status: ExportStatus) {
         DispatchQueue.main.async { [weak self] in
